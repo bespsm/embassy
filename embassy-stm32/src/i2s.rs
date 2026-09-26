@@ -5,7 +5,7 @@
 use embassy_futures::join::join;
 use stm32_metapac::spi::vals;
 
-use crate::dma::{ChannelAndRequest, ReadableRingBuffer, TransferOptions, WritableRingBuffer, ringbuffer};
+use crate::dma::{ChannelAndRequest, ReadableRingBuffer, RingBufferError, TransferOptions, WritableRingBuffer};
 use crate::gpio::{AfType, Flex, OutputType, Speed};
 use crate::mode::Async;
 use crate::pac::spi::Spi as Regs;
@@ -63,15 +63,11 @@ pub enum Error {
     Overrun,
 }
 
-impl From<ringbuffer::Error> for Error {
-    fn from(#[allow(unused)] err: ringbuffer::Error) -> Self {
-        #[cfg(feature = "defmt")]
-        {
-            if err == ringbuffer::Error::DmaUnsynced {
-                defmt::error!("Ringbuffer broken invariants detected!");
-            }
+impl From<RingBufferError> for Error {
+    fn from(e: RingBufferError) -> Self {
+        match e {
+            RingBufferError::Overrun => Self::Overrun,
         }
-        Self::Overrun
     }
 }
 
@@ -531,7 +527,7 @@ impl<'d, W: Word> I2S<'d, W> {
 
         let tx_f = async {
             if let Some(tx_ring_buffer) = &mut self.tx_ring_buffer {
-                tx_ring_buffer.stop().await;
+                tx_ring_buffer.disable_circular_and_wait().await;
 
                 set_txdmaen(regs_tx, false);
             }
@@ -539,7 +535,7 @@ impl<'d, W: Word> I2S<'d, W> {
 
         let rx_f = async {
             if let Some(rx_ring_buffer) = &mut self.rx_ring_buffer {
-                rx_ring_buffer.stop().await;
+                rx_ring_buffer.disable_circular_and_wait().await;
 
                 set_rxdmaen(regs_rx, false);
             }
@@ -588,6 +584,16 @@ impl<'d, W: Word> I2S<'d, W> {
     pub async fn read(&mut self, data: &mut [W]) -> Result<(), Error> {
         match &mut self.rx_ring_buffer {
             Some(ring) => Reader(ring).read(data).await,
+            _ => Err(Error::NotAReceiver),
+        }
+    }
+
+    /// Return the number of samples currently readable from the RX DMA ring buffer.
+    ///
+    /// Returns [`Error::Overrun`] if the DMA has lapped the reader, mirroring [`Self::read`].
+    pub fn rx_len(&mut self) -> Result<usize, Error> {
+        match &mut self.rx_ring_buffer {
+            Some(ring) => Ok(ring.len()?),
             _ => Err(Error::NotAReceiver),
         }
     }

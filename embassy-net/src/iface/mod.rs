@@ -1,8 +1,11 @@
 //! Network interfaces.
 //!
 //! An interface is a [`Driver`] added to a [`Stack`], together with its
-//! configuration: hardware address, IP addresses, and whatever address
-//! autoconfiguration is turned on for it.
+//! configuration.
+//!
+//! Interfaces can be configured manually, or automatically with [`dhcpv4`] or [`slaac`].
+//!
+//! An interface can also hand out addresses itself, as a [`dhcpv4_server`].
 
 #[cfg(feature = "dhcpv4")]
 pub mod dhcpv4;
@@ -13,15 +16,19 @@ use embassy_time::Instant;
 use heapless::Vec;
 use xarxa::config::IFACE_ADDR_COUNT;
 use xarxa::driver::{Capabilities, Driver, LinkState};
+#[cfg(feature = "medium-ieee802154")]
+use xarxa::error::Full;
 #[cfg(feature = "multicast")]
 pub use xarxa::iface::MulticastError;
 #[cfg(feature = "slaac")]
 pub use xarxa::iface::slaac;
 pub use xarxa::iface::{AddIfaceError, AddrError, AddrOrigin, IfaceHandle, Medium, MediumMismatch};
 use xarxa::wire::{HardwareAddress, IpAddr, IpCidr};
+#[cfg(feature = "medium-ieee802154")]
+use xarxa::wire::{Ieee802154Pan, SixlowpanAddressContext};
 
 use crate::time::instant_from_xarxa;
-use crate::{Stack, is_config_up, is_link_up, wait_iface};
+use crate::{NoWake, Stack, Wake, WakeRunner, is_config_up, is_link_up, wait_iface, wake_if};
 
 /// An IP address assigned to an interface.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -61,7 +68,7 @@ impl IfaceAddr {
 
 /// An interface added to a [`Stack`].
 ///
-/// Returned by [`Stack::add_iface`] and [`Stack::iface`]. It's `Copy`,
+/// Returned by [`Stack::add_iface_borrowed`] and [`Stack::iface`]. It's `Copy`,
 /// so you can pass it by value instead of by reference.
 #[derive(Copy, Clone)]
 pub struct Iface<'d> {
@@ -84,48 +91,40 @@ impl<'d> Iface<'d> {
         self.handle
     }
 
-    /// Borrow the interface, without waking the runner.
-    fn with<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd>) -> R) -> R {
+    /// Borrow the interface. Whether the runner is woken afterwards is up to `f`.
+    fn with<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd>) -> (R, WakeRunner)) -> R {
         self.stack.with(|i| f(&mut i.stack.iface(self.handle)))
     }
 
-    /// Borrow the interface, and wake the runner afterwards so it processes what
-    /// changed.
-    fn with_mut<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd>) -> R) -> R {
-        self.stack.with_mut(|i| f(&mut i.stack.iface(self.handle)))
+    /// Borrow the interface to change its configuration, waking the runner if the
+    /// configuration changed.
+    fn with_config<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd>) -> R) -> R {
+        self.with(|i| {
+            let generation = i.config_generation();
+            let r = f(i);
+            (r, wake_if(i.config_generation() != generation))
+        })
     }
 
     /// The capabilities reported by the device.
     pub fn capabilities(&self) -> Capabilities {
-        self.with(|i| i.capabilities())
+        self.with(|i| (i.capabilities(), NoWake))
     }
 
     /// Call `f` with the interface's device.
     pub fn with_driver<R>(&self, f: impl FnOnce(&mut dyn Driver) -> R) -> R {
-        self.with_mut(|i| f(i.driver_mut()))
+        self.with(|i| (f(i.driver_mut()), Wake))
     }
 
     /// The link state reported by the device.
     pub fn link_state(&self) -> LinkState {
-        self.with(|i| i.link_state())
+        self.with(|i| (i.link_state(), NoWake))
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the link-layer header,
-    /// clamped to what a [`PacketBuf`](xarxa::driver::PacketBuf) can carry.
+    /// clamped to what a [`PacketBuf`](crate::driver::PacketBuf) can carry.
     pub fn ip_mtu(&self) -> usize {
-        self.with(|i| i.ip_mtu())
-    }
-
-    /// Poll the device for the timestamp of an already-transmitted packet, sent with
-    /// [`PacketMeta::request_timestamp`](xarxa::driver::PacketMeta::request_timestamp) set.
-    ///
-    /// Returns `None` if no timestamp is available right now, which is also all a
-    /// device without transmit timestamping support ever returns. Timestamps arrive
-    /// an arbitrary time after the packet was sent, possibly out of order, and
-    /// possibly never, so poll this repeatedly rather than once after sending.
-    #[cfg(feature = "packetmeta-timestamp")]
-    pub fn poll_tx_timestamp(&self) -> Option<xarxa::driver::TxTimestamp> {
-        self.with(|i| i.poll_tx_timestamp())
+        self.with(|i| (i.ip_mtu(), NoWake))
     }
 
     /// The hardware address of the interface.
@@ -133,49 +132,106 @@ impl<'d> Iface<'d> {
     /// Initially the address the device reported when the interface was added.
     /// [`set_hardware_addr`](Self::set_hardware_addr) overrides it.
     pub fn hardware_addr(&self) -> HardwareAddress {
-        self.with(|i| i.hardware_addr())
+        self.with(|i| (i.hardware_addr(), NoWake))
     }
 
     /// Set the hardware address of the interface.
     ///
     /// The stack starts using it for the frames it sends and for ingress filtering
     /// immediately. It does not announce the change on the link, so peers keep the
-    /// old address in their neighbor caches until it expires.
+    /// old address in their neighbor caches until it expires. Send a gratuitous ARP
+    /// or unsolicited neighbor advertisement from a raw socket if that matters.
     ///
-    /// Errors:
-    /// - `MediumMismatch` if the address is not of the kind the interface's
+    /// An IEEE 802.15.4 interface must use an extended address. A short address
+    /// is accepted, but the stack can not put it in NDISC link-layer address
+    /// options, so neighbor discovery does not work with one.
+    ///
+    /// # Errors
+    /// - `MediumMismatch`: if the address is not of the kind the interface's
     ///   medium uses. The interface is left unchanged.
     pub fn set_hardware_addr(&self, addr: HardwareAddress) -> Result<(), MediumMismatch> {
-        self.with_mut(|i| i.set_hardware_addr(addr))
+        self.with_config(|i| i.set_hardware_addr(addr))
     }
 
-    /// The IP addresses assigned to the interface.
+    /// The PAN identifier of an IEEE 802.15.4 interface, `None` for any PAN.
+    #[cfg(feature = "medium-ieee802154")]
+    pub fn pan_id(&self) -> Option<Ieee802154Pan> {
+        self.with(|i| (i.pan_id(), NoWake))
+    }
+
+    /// Set the PAN identifier of an IEEE 802.15.4 interface.
+    ///
+    /// With a PAN set, frames for another PAN are dropped, except broadcast
+    /// ones. With `None`, the default, frames for every PAN are accepted.
+    /// Sent frames carry the PAN, or a zero PAN with `None`.
+    ///
+    /// Does nothing on other media.
+    #[cfg(feature = "medium-ieee802154")]
+    pub fn set_pan_id(&self, pan_id: Option<Ieee802154Pan>) {
+        self.with(|i| (i.set_pan_id(pan_id), NoWake))
+    }
+
+    /// The 6LoWPAN address contexts, by context identifier, passed to `f`.
+    #[cfg(feature = "medium-ieee802154")]
+    pub fn sixlowpan_address_context<R>(&self, f: impl FnOnce(&[SixlowpanAddressContext]) -> R) -> R {
+        self.with(|i| (f(i.sixlowpan_address_context()), NoWake))
+    }
+
+    /// Replace the 6LoWPAN address contexts.
+    ///
+    /// Received packets whose addresses are compressed against a context
+    /// identifier are resolved with the context at that index. Sent packets
+    /// never use contexts.
+    ///
+    /// # Errors
+    /// - `Full`: if the contexts do not fit. Only possible without the `alloc`
+    ///   feature, where the limit is
+    ///   [`SIXLOWPAN_ADDRESS_CONTEXT_COUNT`](crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT).
+    ///   The interface is left unchanged.
+    #[cfg(feature = "medium-ieee802154")]
+    pub fn set_sixlowpan_address_context(
+        &self,
+        contexts: impl IntoIterator<Item = SixlowpanAddressContext>,
+    ) -> Result<(), Full> {
+        self.with(|i| (i.set_sixlowpan_address_context(contexts), NoWake))
+    }
+
+    /// The IP addresses assigned to the interface, with their origin.
     pub fn ip_addrs(&self) -> Vec<IfaceAddr, IFACE_ADDR_COUNT> {
-        self.with(|i| i.ip_addrs().iter().copied().map(IfaceAddr::from_xarxa).collect())
+        self.with(|i| {
+            (
+                i.ip_addrs().iter().copied().map(IfaceAddr::from_xarxa).collect(),
+                NoWake,
+            )
+        })
     }
 
-    /// Whether the given address is assigned to the interface.
+    /// Check whether the given address is assigned to the interface.
     pub fn has_ip_addr(&self, addr: impl Into<IpAddr>) -> bool {
-        self.with(|i| i.has_ip_addr(addr))
+        self.with(|i| (i.has_ip_addr(addr), NoWake))
     }
 
     /// Assign an IP address to the interface.
     ///
     /// If the same address is already assigned, its prefix is updated and the
     /// previous CIDR returned. Otherwise the address is appended and `None` is
-    /// returned.
+    /// returned. Source address selection prefers the first address matching the
+    /// destination's subnet, so ordering only matters between addresses of the same
+    /// subnet.
     ///
-    /// Errors:
-    /// - `NotUnicast` if the address is not unicast.
-    /// - `Full` if the interface has no room for another address.
+    /// # Errors
+    /// - `NotUnicast`: if the address is not unicast.
+    /// - `Full`: if the interface has no room for another address. Only possible
+    ///   without the `alloc` feature, where the limit is
+    ///   [`IFACE_ADDR_COUNT`].
     pub fn add_ip_addr(&self, cidr: IpCidr) -> Result<Option<IpCidr>, AddrError> {
-        self.with_mut(|i| i.add_ip_addr(cidr))
+        self.with_config(|i| i.add_ip_addr(cidr))
     }
 
     /// Unassign an IP address from the interface, returning the CIDR it was
     /// assigned with, or `None` if it was not assigned.
     pub fn remove_ip_addr(&self, addr: impl Into<IpAddr>) -> Option<IpCidr> {
-        self.with_mut(|i| i.remove_ip_addr(addr))
+        self.with_config(|i| i.remove_ip_addr(addr))
     }
 
     /// Replace the interface's entire set of IP addresses.
@@ -185,19 +241,20 @@ impl<'d> Iface<'d> {
     ///
     /// On error the interface is left unchanged.
     ///
-    /// Errors:
-    /// - `NotUnicast` if any of the addresses is not unicast.
-    /// - `Full` if the addresses do not fit.
+    /// # Errors
+    /// - `NotUnicast`: if any of the addresses is not unicast.
+    /// - `Full`: if the addresses do not fit. Only possible without the `alloc`
+    ///   feature, where the limit is [`IFACE_ADDR_COUNT`].
     pub fn set_ip_addrs(&self, addrs: impl IntoIterator<Item = IpCidr>) -> Result<(), AddrError> {
-        self.with_mut(|i| i.set_ip_addrs(addrs))
+        self.with_config(|i| i.set_ip_addrs(addrs))
     }
 
     /// A counter that goes up every time the interface's configuration changes
-    /// for any reason (manual changes, DHCP, SLAAC).
+    /// for any reason (manual changes, DHCP, SLAAC)
     ///
     /// Compare it with a saved value to find out whether anything changed since.
     pub fn config_generation(&self) -> u32 {
-        self.with(|i| i.config_generation())
+        self.with(|i| (i.config_generation(), NoWake))
     }
 
     /// Turn the DHCPv4 client on, with the given configuration, or off with `None`.
@@ -208,24 +265,27 @@ impl<'d> Iface<'d> {
     /// client is turned off. Turning it on when it is already on restarts it with
     /// the new configuration.
     ///
-    /// Errors:
-    /// - `MediumMismatch` if the interface is not an Ethernet interface.
+    /// # Errors
+    /// - `MediumMismatch`: if the interface is not an Ethernet interface.
     #[cfg(feature = "dhcpv4")]
     pub fn set_dhcpv4(&self, config: Option<dhcpv4::DhcpConfig>) -> Result<(), MediumMismatch> {
-        self.with_mut(|i| i.set_dhcpv4(config.map(|c| c.to_xarxa())))
+        self.with(|i| crate::wake_if_ok(i.set_dhcpv4(config.map(|c| c.to_xarxa()))))
     }
 
-    /// The current DHCPv4 lease, if the client is on and has one.
+    /// The lease the DHCPv4 client currently holds, if any.
     #[cfg(feature = "dhcpv4")]
     pub fn dhcpv4_lease(&self) -> Option<dhcpv4::DhcpLease> {
-        self.with(|i| i.dhcpv4_lease().cloned())
+        self.with(|i| (i.dhcpv4_lease().cloned(), NoWake))
     }
 
-    /// Restart the DHCPv4 client, dropping the current lease and starting discovery
-    /// over.
+    /// Drop the DHCPv4 lease, if any, and look for a server again.
+    ///
+    /// The [`Runner`](crate::Runner) does this when the link comes back up; call it
+    /// directly for a driver that cannot report link state. Does nothing if the client
+    /// is off.
     #[cfg(feature = "dhcpv4")]
     pub fn restart_dhcpv4(&self) {
-        self.with_mut(|i| i.restart_dhcpv4())
+        self.with(|i| (i.restart_dhcpv4(), Wake))
     }
 
     /// Turn the DHCPv4 server on, with the given configuration, or off with `None`.
@@ -241,23 +301,23 @@ impl<'d> Iface<'d> {
     ///
     /// On error the server is left as it was.
     ///
-    /// Errors:
-    /// - `MediumMismatch` if the interface is not an Ethernet interface.
-    /// - `InvalidPool` if `pool_end` is below `pool_start`.
+    /// # Errors
+    /// - `MediumMismatch`: if the interface is not an Ethernet interface.
+    /// - `InvalidPool`: if `pool_end` is below `pool_start`.
     #[cfg(feature = "dhcpv4-server")]
     pub fn set_dhcpv4_server(
         &self,
         config: Option<dhcpv4_server::DhcpServerConfig>,
     ) -> Result<(), dhcpv4_server::DhcpServerError> {
-        self.with_mut(|i| i.set_dhcpv4_server(config.map(|c| c.to_xarxa())))
+        self.with(|i| (i.set_dhcpv4_server(config.map(|c| c.to_xarxa())), NoWake))
     }
 
     /// Call `f` with an iterator over the DHCP server's lease table. It is empty
     /// if the server is off.
     ///
     /// All entries are passed, whether their lease is running or already over.
-    /// Check each entry's [`state`](dhcpv4_server::DhcpServerLease::state) and
-    /// [`expires_at`](dhcpv4_server::DhcpServerLease::expires_at).
+    /// Check each entry's [`state`](self::dhcpv4_server::DhcpServerLease::state)
+    /// and [`expires_at`](self::dhcpv4_server::DhcpServerLease::expires_at).
     #[cfg(feature = "dhcpv4-server")]
     pub fn dhcpv4_server_leases<R>(
         &self,
@@ -268,7 +328,7 @@ impl<'d> Iface<'d> {
                 .dhcpv4_server_leases()
                 .iter()
                 .map(|l| dhcpv4_server::DhcpServerLease::from_xarxa(l.clone()));
-            f(&mut leases)
+            (f(&mut leases), NoWake)
         })
     }
 
@@ -278,52 +338,81 @@ impl<'d> Iface<'d> {
     /// The client is not told: it keeps using the address until it next renews.
     #[cfg(feature = "dhcpv4-server")]
     pub fn remove_dhcpv4_server_lease(&self, address: xarxa::wire::Ipv4Addr) -> bool {
-        self.with_mut(|i| i.remove_dhcpv4_server_lease(address))
+        self.with(|i| (i.remove_dhcpv4_server_lease(address), NoWake))
     }
 
-    /// Turn SLAAC on, with the given configuration, or off with `None`.
+    /// Turn IPv6 stateless address autoconfiguration on, with the given
+    /// configuration, or off with `None`.
     ///
-    /// Errors:
-    /// - `MediumMismatch` if the interface is not an Ethernet or IEEE 802.15.4
+    /// While on, the stack sends router solicitations from the [`Runner`](crate::Runner).
+    /// Every prefix a router advertises for autoconfiguration becomes an address on the
+    /// interface (the prefix plus the EUI-64 of the hardware address), and every
+    /// advertising router becomes a default route. Both are removed when their
+    /// lifetime runs out or when SLAAC is turned off. Turning it on when it is
+    /// already on restarts it.
+    ///
+    /// # Errors
+    /// - `MediumMismatch`: if the interface is not an Ethernet or IEEE 802.15.4
     ///   interface.
     #[cfg(feature = "slaac")]
     pub fn set_slaac(&self, config: Option<slaac::SlaacConfig>) -> Result<(), MediumMismatch> {
-        self.with_mut(|i| i.set_slaac(config))
+        self.with(|i| crate::wake_if_ok(i.set_slaac(config)))
     }
 
-    /// The current SLAAC state, if it is on.
+    /// What SLAAC has learned from the routers on the link, or `None` if SLAAC is off.
     #[cfg(feature = "slaac")]
     pub fn slaac(&self) -> Option<slaac::SlaacState> {
-        self.with(|i| i.slaac().copied())
+        self.with(|i| (i.slaac().copied(), NoWake))
     }
 
-    /// Restart SLAAC, soliciting routers again.
+    /// Solicit routers again, keeping the addresses and routes already configured.
+    ///
+    /// The [`Runner`](crate::Runner) does this when the link comes back up; call it
+    /// directly for a driver that cannot report link state. Does nothing if SLAAC is off.
     #[cfg(feature = "slaac")]
     pub fn restart_slaac(&self) {
-        self.with_mut(|i| i.restart_slaac())
+        self.with(|i| (i.restart_slaac(), Wake))
     }
 
     /// Join a multicast group.
+    ///
+    /// The stack accepts packets sent to the group right away, and reports the
+    /// membership to the routers on the link from the [`Runner`](crate::Runner).
+    ///
+    /// # Errors
+    /// - `Unaddressable`: if the address is not a multicast address.
     #[cfg(feature = "multicast")]
     pub fn join_multicast_group(&self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
-        self.with_mut(|i| i.join_multicast_group(addr))
+        self.with(|i| crate::wake_if_ok(i.join_multicast_group(addr)))
     }
 
     /// Leave a multicast group.
+    ///
+    /// The stack stops accepting packets sent to the group right away, and
+    /// reports the leave to the routers on the link from the
+    /// [`Runner`](crate::Runner). Leaving a group that was not joined
+    /// does nothing.
+    ///
+    /// # Errors
+    /// - `Unaddressable`: if the address is not a multicast address.
     #[cfg(feature = "multicast")]
     pub fn leave_multicast_group(&self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
-        self.with_mut(|i| i.leave_multicast_group(addr))
+        self.with(|i| crate::wake_if_ok(i.leave_multicast_group(addr)))
     }
 
-    /// Whether the interface has joined the given multicast group.
+    /// Check whether the interface listens to the given multicast address.
+    ///
+    /// Besides the joined groups, this is true for the groups every host is a
+    /// member of: the IPv4 all systems group, the IPv6 all nodes group, and the
+    /// IPv6 solicited node group of each address assigned to the interface.
     #[cfg(feature = "multicast")]
     pub fn has_multicast_group(&self, addr: impl Into<IpAddr>) -> bool {
-        self.with(|i| i.has_multicast_group(addr))
+        self.with(|i| (i.has_multicast_group(addr), NoWake))
     }
 
     /// Whether the link is up.
     pub fn is_link_up(&self) -> bool {
-        self.with(is_link_up)
+        self.with(|i| (is_link_up(i), NoWake))
     }
 
     /// Whether the interface has an address that something other than IPv6
@@ -331,19 +420,19 @@ impl<'d> Iface<'d> {
     ///
     /// That is: a static address was assigned, or DHCPv4 or SLAAC completed.
     pub fn is_config_up(&self) -> bool {
-        self.with(|i| is_config_up(i))
+        self.with(|i| (is_config_up(i), NoWake))
     }
 
     /// Check whether the network stack has a valid IPv4 configuration.
     #[cfg(feature = "ipv4")]
     pub fn is_config_v4_up(&self) -> bool {
-        self.with(|i| crate::is_config_v4_up(i))
+        self.with(|i| (crate::is_config_v4_up(i), NoWake))
     }
 
     /// Check whether the network stack has a valid non link-local IPv6 configuration.
     #[cfg(feature = "ipv6")]
     pub fn is_config_v6_up(&self) -> bool {
-        self.with(|i| crate::is_config_v6_up(i))
+        self.with(|i| (crate::is_config_v6_up(i), NoWake))
     }
 
     /// Wait for the network device to obtain a link signal.

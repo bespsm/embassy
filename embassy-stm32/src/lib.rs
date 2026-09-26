@@ -94,8 +94,44 @@ pub mod can;
 pub mod comp;
 #[cfg(all(cordic, not(stm32c5)))]
 pub mod cordic;
-#[cfg(any(aes, saes))]
+#[cfg(any(aes, saes, cryp))]
 mod crypto;
+#[cfg(any(
+    all(
+        aes,
+        any(
+            feature = "embassy-crypto-aes128-ecb",
+            feature = "embassy-crypto-aes128-cbc",
+            feature = "embassy-crypto-aes128-ctr",
+            feature = "embassy-crypto-aes128-gcm",
+            feature = "embassy-crypto-aes128-ccm",
+            feature = "embassy-crypto-aes128-cmac",
+            feature = "embassy-crypto-aes256-ecb",
+            feature = "embassy-crypto-aes256-cbc",
+            feature = "embassy-crypto-aes256-ctr",
+            feature = "embassy-crypto-aes256-gcm",
+            feature = "embassy-crypto-aes256-ccm",
+        )
+    ),
+    all(
+        cryp,
+        any(
+            feature = "embassy-crypto-aes128-ecb",
+            feature = "embassy-crypto-aes128-cbc",
+            feature = "embassy-crypto-aes128-ctr",
+            feature = "embassy-crypto-aes128-gcm",
+            feature = "embassy-crypto-aes128-ccm",
+            feature = "embassy-crypto-aes128-cmac",
+            feature = "embassy-crypto-aes256-ecb",
+            feature = "embassy-crypto-aes256-cbc",
+            feature = "embassy-crypto-aes256-ctr",
+            feature = "embassy-crypto-aes256-gcm",
+            feature = "embassy-crypto-aes256-ccm",
+            feature = "embassy-crypto-aes256-cmac",
+        )
+    ),
+))]
+mod crypto_driver;
 
 #[cfg(not(any(comp_u5, comp_v1, comp_v2, comp_u0)))]
 pub mod comp {
@@ -162,7 +198,7 @@ pub mod fmc;
 pub mod gfxmmu;
 #[cfg(gfxtim)]
 pub mod gfxtim;
-#[cfg(all(gpu2d, stm32u5))]
+#[cfg(gpu2d)]
 pub mod gpu2d;
 #[cfg(all(hash, not(stm32c5)))]
 pub mod hash;

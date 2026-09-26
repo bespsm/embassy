@@ -71,7 +71,7 @@ pub enum TryError<T> {
 /// (with `StaticCell`), or declare it before the stack.
 ///
 /// This holds only the stack-wide state. The drivers live wherever the caller
-/// puts them, and are handed to [`Stack::add_iface`].
+/// puts them, and are handed to [`Stack::add_iface_borrowed`].
 ///
 /// Socket storage is not here either: the stack has a fixed number of socket
 /// slots per type, set by the `*-socket-count-N` features of `xarxa`, and the
@@ -93,6 +93,26 @@ impl Default for StackStorage<'_> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether the runner must be woken after a [`Stack::with`] closure, to process
+/// what the closure changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeRunner {
+    Wake,
+    NoWake,
+}
+pub(crate) use WakeRunner::{NoWake, Wake};
+
+/// `Wake` if `wake`, `NoWake` otherwise.
+pub(crate) fn wake_if(wake: bool) -> WakeRunner {
+    if wake { Wake } else { NoWake }
+}
+
+/// Pass `r` through, waking the runner if it is `Ok`.
+pub(crate) fn wake_if_ok<T, E>(r: Result<T, E>) -> (Result<T, E>, WakeRunner) {
+    let wake = wake_if(r.is_ok());
+    (r, wake)
 }
 
 pub(crate) struct Inner<'d> {
@@ -120,10 +140,14 @@ pub struct Stack<'d> {
 }
 
 impl<'d> Stack<'d> {
-    /// Create a new network stack.
+    /// Create a network stack.
+    ///
+    /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
+    /// numbers and ephemeral ports. This should be random, or at least different
+    /// at every boot.
     ///
     /// The stack starts out with no interfaces: add them with
-    /// [`add_iface`](Self::add_iface).
+    /// [`add_iface_borrowed`](Self::add_iface_borrowed).
     pub fn new(storage: &'d mut StackStorage<'d>, random_seed: u64) -> (Self, Runner<'d>) {
         #[allow(unused_mut)]
         let mut stack = xarxa::Stack::new(random_seed);
@@ -153,86 +177,143 @@ impl<'d> Stack<'d> {
         (stack, Runner { stack })
     }
 
-    /// Borrow the stack, without waking the runner.
-    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner<'d>) -> R) -> R {
-        f(&mut self.inner.borrow_mut())
-    }
-
-    /// Borrow the stack, and wake the runner afterwards so it processes what
-    /// changed.
-    pub(crate) fn with_mut<R>(&self, f: impl FnOnce(&mut Inner<'d>) -> R) -> R {
+    /// Borrow the stack. `f` says whether the runner must be woken afterwards.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner<'d>) -> (R, WakeRunner)) -> R {
         let mut inner = self.inner.borrow_mut();
-        let r = f(&mut inner);
-        inner.waker.wake();
+        let (r, wake) = f(&mut inner);
+        if wake == Wake {
+            inner.waker.wake();
+        }
         r
     }
 
-    /// Add an interface to the stack, taking ownership of the driver.
+    /// Take the timestamp of an already-transmitted packet, sent with
+    /// [`PacketMeta::request_timestamp`](crate::driver::PacketMeta::request_timestamp) set.
     ///
-    /// See [`add_iface`](Self::add_iface) for the no-alloc version.
+    /// The timestamps of every interface land in one queue, which the [`Runner`] fills
+    /// from the drivers. This only reads it, so run the runner concurrently.
     ///
-    /// Errors:
-    /// - `Full` if the stack has no room for another interface.
-    /// - `UnsupportedMedium` if the build has no `medium-*` feature for the
-    ///   driver's medium.
-    /// - `HardwareAddrMismatch` if the hardware address the driver reports is not
-    ///   of the kind its medium uses.
+    /// Timestamps arrive an arbitrary time after the packet was sent, possibly out of
+    /// order, and possibly never: a device may not support transmit timestamping, may
+    /// have run out of timestamp slots, or the queue may have been full (its capacity
+    /// is [`TX_TIMESTAMP_QUEUE_COUNT`](crate::config::TX_TIMESTAMP_QUEUE_COUNT)). Time
+    /// out waiting for one rather than expecting it.
+    ///
+    /// The queue has one consumer, so the packet ids it reports back must be unique
+    /// across everything the application sends, on every interface. Don't reuse an id
+    /// while a timestamp for the old packet can still arrive. Removing an interface
+    /// does not drop the timestamps it already queued.
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub fn poll_tx_timestamp(&self) -> Option<driver::TxTimestamp> {
+        self.with(|i| (i.stack.poll_tx_timestamp(), NoWake))
+    }
+
+    /// Wait for a TX timestamp from the stack-wide queue.
+    ///
+    /// Only one task may wait at a time. See [`Self::poll_tx_timestamp`] for packet ID
+    /// and delivery requirements. Cancelling a pending wait consumes no timestamp.
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub fn tx_timestamp(&self) -> impl Future<Output = driver::TxTimestamp> + '_ {
+        poll_fn(|cx| {
+            self.with(|i| {
+                i.stack.register_tx_timestamp_waker(cx.waker());
+                (i.stack.poll_tx_timestamp().map_or(Poll::Pending, Poll::Ready), NoWake)
+            })
+        })
+    }
+
+    /// Add an interface to the stack, returning it.
+    ///
+    /// The stack owns the boxed device, so this needs the `alloc` feature.
+    /// Without alloc, use the borrowing [`add_iface_borrowed`](Self::add_iface_borrowed).
+    ///
+    /// Configure the interface after adding it. At minimum, you will want to
+    /// add an IP address to it.
+    ///
+    /// # Errors
+    /// - `Full`: if the stack has no room for another interface. Only possible
+    ///   without the `alloc` feature, where the limit is
+    ///   [`IFACE_COUNT`](crate::config::IFACE_COUNT).
+    /// - `UnsupportedMedium`: if the build has no `medium-*` feature for the
+    ///   device's medium.
+    /// - `HardwareAddrMismatch`: if the hardware address the device reports is
+    ///   not of the kind its medium uses.
     #[cfg(feature = "alloc")]
     pub fn add_iface(&self, driver: alloc::boxed::Box<dyn Driver + 'd>) -> Result<Iface<'d>, AddIfaceError> {
-        let handle = self.with_mut(|i| i.stack.add_iface(driver))?;
+        let handle = self.with(|i| wake_if_ok(i.stack.add_iface(driver)))?;
         Ok(self.iface(handle))
     }
 
-    /// Add an interface to the stack, borrowing the driver.
+    /// Add an interface to the stack, lending it the device, and returning it.
     ///
-    /// The driver is borrowed for as long as the stack lives. With a `StaticCell`
+    /// The device is borrowed for as long as the stack lives. With a `StaticCell`
     /// that is `'static`; with a local, the enclosing scope.
+    /// Otherwise this is `add_iface`.
     ///
     /// # Example
     /// ```ignore
     /// static ETH: StaticCell<Device> = StaticCell::new();
-    /// let eth = stack.add_iface(ETH.init(device)).unwrap();
+    /// let eth = stack.add_iface_borrowed(ETH.init(device)).unwrap();
     /// ```
     ///
-    /// Errors:
-    /// - `Full` if the stack has no room for another interface.
-    /// - `UnsupportedMedium` if the build has no `medium-*` feature for the
-    ///   driver's medium.
-    /// - `HardwareAddrMismatch` if the hardware address the driver reports is not
-    ///   of the kind its medium uses.
-    pub fn add_iface(&self, driver: &'d mut dyn Driver) -> Result<Iface<'d>, AddIfaceError> {
-        let handle = self.with_mut(|i| i.stack.add_iface_borrowed(driver))?;
+    /// # Errors
+    /// - `Full`: if the stack has no room for another interface. Only possible
+    ///   without the `alloc` feature, where the limit is
+    ///   [`IFACE_COUNT`](crate::config::IFACE_COUNT).
+    /// - `UnsupportedMedium`: if the build has no `medium-*` feature for the
+    ///   device's medium.
+    /// - `HardwareAddrMismatch`: if the hardware address the device reports is
+    ///   not of the kind its medium uses.
+    pub fn add_iface_borrowed(&self, driver: &'d mut dyn Driver) -> Result<Iface<'d>, AddIfaceError> {
+        let handle = self.with(|i| wake_if_ok(i.stack.add_iface_borrowed(driver)))?;
         Ok(self.iface(handle))
     }
 
     /// Get an interface by its handle.
     ///
     /// # Panics
-    /// Panics if the handle does not belong to an interface on this stack.
+    /// Panics if the handle is stale (the interface was removed).
     pub fn iface(&self, handle: IfaceHandle) -> Iface<'d> {
         self.with(|i| {
             // Check the handle is live, so a bad one panics here instead of somewhere
             // deeper the first time the interface is used.
             let _ = i.stack.iface(handle).capabilities();
+            ((), NoWake)
         });
         Iface::new(*self, handle)
     }
 
     /// Remove an interface from the stack.
     ///
-    /// Its addresses, routes and neighbor cache entries go with it. Sockets bound
-    /// to one of its addresses are not closed, they just stop receiving.
-    ///
     /// # Panics
-    /// Panics if the handle does not belong to an interface on this stack.
+    /// Panics if the handle is stale (the interface was already removed).
     pub fn remove_iface(&self, handle: IfaceHandle) {
-        self.with_mut(|i| i.stack.remove_iface(handle))
+        self.with(|i| (i.stack.remove_iface(handle), Wake))
+    }
+
+    /// Iterate over the interfaces added to the stack.
+    pub fn ifaces(&self) -> impl Iterator<Item = Iface<'d>> + 'd {
+        let stack = *self;
+        let mut n = 0;
+        core::iter::from_fn(move || {
+            let handle = stack.with(|i| {
+                let mut iter = i.stack.ifaces();
+                for _ in 0..n {
+                    if iter.next().is_none() {
+                        return (None, NoWake);
+                    }
+                }
+                (iter.next().map(|(handle, _)| handle), NoWake)
+            })?;
+            n += 1;
+            Some(stack.iface(handle))
+        })
     }
 
     /// The stack's hostname, or `None` if not set.
     #[cfg(feature = "hostname")]
     pub fn hostname<R>(&self, f: impl FnOnce(Option<&str>) -> R) -> R {
-        self.with(|i| f(i.stack.hostname()))
+        self.with(|i| (f(i.stack.hostname()), NoWake))
     }
 
     /// Set the stack's hostname.
@@ -242,21 +323,39 @@ impl<'d> Stack<'d> {
     ///
     /// An empty string clears the hostname.
     ///
-    /// Errors:
-    /// - `HostnameTooLong` if `hostname` is longer than 63 bytes. The stack is
-    ///   left unchanged.
+    /// # Errors
+    /// - `HostnameTooLong`: if `hostname` is longer than 63 bytes. The hostname
+    ///   is left unchanged.
     #[cfg(feature = "hostname")]
     pub fn set_hostname(&self, hostname: &str) -> Result<(), HostnameTooLong> {
-        self.with_mut(|i| i.stack.set_hostname(hostname))
+        self.with(|i| (i.stack.set_hostname(hostname), NoWake))
     }
 
-    /// The stack's neighbor cache, shared by all interfaces.
+    /// Get the packet reassembly timeout.
+    ///
+    /// This is how long the fragments of an incoming IPv4 or 6LoWPAN packet are
+    /// kept while waiting for the rest of it. The default is 60 seconds.
+    #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
+    pub fn reassembly_timeout(&self) -> embassy_time::Duration {
+        self.with(|i| (time::duration_from_xarxa(i.stack.reassembly_timeout()), NoWake))
+    }
+
+    /// Set the packet reassembly timeout.
+    ///
+    /// Fragments of an incoming IPv4 or 6LoWPAN packet that is not complete by
+    /// then are dropped, and the packet buffer they were kept in is freed.
+    #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
+    pub fn set_reassembly_timeout(&self, timeout: embassy_time::Duration) {
+        self.with(|i| (i.stack.set_reassembly_timeout(time::duration_to_xarxa(timeout)), NoWake))
+    }
+
+    /// Access the neighbor cache.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub fn neighbor_cache(&self) -> NeighborCache<'d> {
         NeighborCache::new(*self)
     }
 
-    /// The stack's routing table, shared by all interfaces.
+    /// Access the routing table.
     pub fn routes(&self) -> Routes<'d> {
         Routes::new(*self)
     }
@@ -268,7 +367,7 @@ impl<'d> Stack<'d> {
     /// those, and come first.
     #[cfg(feature = "dns")]
     pub fn set_dns_servers(&self, servers: &[crate::wire::IpAddr]) {
-        self.with_mut(|i| {
+        self.with(|i| {
             i.static_dns_servers.clear();
             for s in servers {
                 if i.static_dns_servers.push(*s).is_err() {
@@ -277,6 +376,7 @@ impl<'d> Stack<'d> {
                 }
             }
             i.update_dns_servers();
+            ((), NoWake)
         })
     }
 
@@ -307,17 +407,17 @@ impl<'d> Stack<'d> {
         }
 
         let query = poll_fn(|cx| {
-            self.with_mut(|i| {
+            self.with(|i| {
                 let Inner {
                     stack, dns, dns_waker, ..
                 } = i;
                 match dns.start_query(stack, name, qtype) {
-                    Ok(handle) => Poll::Ready(Ok::<_, dns::Error>(handle)),
+                    Ok(handle) => (Poll::Ready(Ok::<_, dns::Error>(handle)), Wake),
                     Err(xarxa::dns::StartQueryError::NoFreeSlot) => {
                         dns_waker.register(cx.waker());
-                        Poll::Pending
+                        (Poll::Pending, NoWake)
                     }
-                    Err(e) => Poll::Ready(Err(e.into())),
+                    Err(e) => (Poll::Ready(Err(e.into())), NoWake),
                 }
             })
         })
@@ -347,26 +447,32 @@ impl<'d> Stack<'d> {
         }
 
         let drop = OnDrop::new(|| {
-            self.with_mut(|i| {
+            self.with(|i| {
                 i.dns.cancel_query(query);
                 i.dns_waker.wake();
+                ((), NoWake)
             })
         });
 
         let res = poll_fn(|cx| {
-            self.with_mut(|i| match i.dns.get_query_result(query) {
-                Ok(addrs) => {
-                    i.dns_waker.wake();
-                    Poll::Ready(Ok(addrs))
-                }
-                Err(xarxa::dns::GetQueryResultError::Pending) => {
-                    i.dns.register_query_waker(query, cx.waker());
-                    Poll::Pending
-                }
-                Err(e) => {
-                    i.dns_waker.wake();
-                    Poll::Ready(Err(e.into()))
-                }
+            self.with(|i| {
+                (
+                    match i.dns.get_query_result(query) {
+                        Ok(addrs) => {
+                            i.dns_waker.wake();
+                            Poll::Ready(Ok(addrs))
+                        }
+                        Err(xarxa::dns::GetQueryResultError::Pending) => {
+                            i.dns.register_query_waker(query, cx.waker());
+                            Poll::Pending
+                        }
+                        Err(e) => {
+                            i.dns_waker.wake();
+                            Poll::Ready(Err(e.into()))
+                        }
+                    },
+                    NoWake,
+                )
             })
         })
         .await;
@@ -387,10 +493,10 @@ impl<'d> Stack<'d> {
                     .iter()
                     .any(|a| matches!(a.cidr, xarxa::wire::IpCidr::V6(_)) && !is_link_local(a))
                 {
-                    return true;
+                    return (true, NoWake);
                 }
             }
-            false
+            (false, NoWake)
         })
     }
 }
@@ -408,7 +514,7 @@ impl<'d> Runner<'d> {
     /// You must call this in a background task, to process network events.
     pub async fn run(&mut self) -> ! {
         poll_fn(|cx| {
-            self.stack.with(|i| i.poll(cx));
+            self.stack.with(|i| (i.poll(cx), NoWake));
             Poll::<()>::Pending
         })
         .await;
@@ -527,12 +633,15 @@ pub(crate) fn wait_iface<'a>(
     poll_fn(move |cx| {
         stack.with(|i| {
             let mut iface = i.stack.iface(handle);
-            if predicate(&mut iface) {
-                Poll::Ready(())
-            } else {
-                iface.register_waker(cx.waker());
-                Poll::Pending
-            }
+            (
+                if predicate(&mut iface) {
+                    Poll::Ready(())
+                } else {
+                    iface.register_waker(cx.waker());
+                    Poll::Pending
+                },
+                NoWake,
+            )
         })
     })
 }

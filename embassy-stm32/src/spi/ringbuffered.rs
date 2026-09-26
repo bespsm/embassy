@@ -8,7 +8,7 @@ use embassy_embedded_hal::SetConfig;
 use embedded_io_async::ReadReady;
 use futures_util::future::select;
 
-use crate::dma::ReadableRingBuffer;
+use crate::dma::{ReadableRingBuffer, RingBufferError};
 use crate::gpio::Flex;
 use crate::mode::Async;
 use crate::rcc::WakeGuard;
@@ -58,7 +58,6 @@ pub struct RingBufferedSpiRx<'d, W: Word> {
     _mosi: Option<Flex<'d>>,
     _miso: Option<Flex<'d>>,
     nss: CsPinType<'d>,
-    nss_polarity: SlaveSelectPolarity,
     ring_buf: ReadableRingBuffer<'d, W>,
 }
 
@@ -103,16 +102,6 @@ impl<'d> Spi<'d, Async, Slave> {
 
         let wake_guard = self.info.rcc.wake_guard();
 
-        #[cfg(any(spi_v4, spi_v5, spi_v6))]
-        let nss_polarity = if self.info.regs.cfg2().read().ssiop() == super::vals::Ssiop::ActiveLow {
-            SlaveSelectPolarity::ActiveLow
-        } else {
-            SlaveSelectPolarity::ActiveHigh
-        };
-
-        #[cfg(not(any(spi_v4, spi_v5, spi_v6)))]
-        let nss_polarity = SlaveSelectPolarity::ActiveLow;
-
         // Don't disable the clock
         mem::forget(self);
 
@@ -128,7 +117,6 @@ impl<'d> Spi<'d, Async, Slave> {
             _mosi: mosi,
             _miso: miso,
             nss,
-            nss_polarity,
             ring_buf,
         }
     }
@@ -137,10 +125,6 @@ impl<'d> Spi<'d, Async, Slave> {
 impl<'d, W: Word> RingBufferedSpiRx<'d, W> {
     /// Reconfigure the driver
     pub fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
-        #[cfg(any(spi_v4, spi_v5, spi_v6))]
-        {
-            self.nss_polarity = config.nss_polarity;
-        }
         #[cfg(gpio_v2)]
         super::set_speed(&self._sck, &self._mosi, config.gpio_speed);
         reconfigure(self.info, self.kernel_clock, config)
@@ -162,7 +146,7 @@ impl<'d, W: Word> RingBufferedSpiRx<'d, W> {
     }
 
     /// Stop DMA backed SPI receiver
-    fn stop(&mut self) {
+    pub fn stop(&mut self) {
         self.ring_buf.request_pause();
 
         set_rxdmaen(self.info.regs, false);
@@ -174,9 +158,17 @@ impl<'d, W: Word> RingBufferedSpiRx<'d, W> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Clears ring buffer.
-    pub fn clear(&mut self) {
+    /// Discards all data currently in the ring buffer.
+    /// Returns error that were detected during background reception,
+    /// and were not yet consumed by calling read functions.
+    /// After calling this function ring buffer is empty and has no errors.
+    pub fn clear(&mut self) -> Result<(), Error> {
+        let sr = self.info.regs.sr().read();
+        clear_spi_errors(self.info.regs);
+        // clear ring buffer after clearing errors, otherwise errors
+        // that occur between could leave garbage and be unnoticed
         self.ring_buf.clear();
+        check_error_flags(sr, true)
     }
 
     /// (Re-)start DMA and SPI if it is not running (has not been started yet or has failed), and
@@ -246,7 +238,7 @@ impl<'d, W: Word> RingBufferedSpiRx<'d, W> {
         });
 
         // Future which completes when NSS deselect edge is detected
-        let exti = pin!(self.nss.wait_for_edge(self.nss_polarity));
+        let exti = pin!(self.nss.wait_for_edge(SlaveSelectPolarity::from_regs(self.info.regs)));
 
         select(exti, dma).await;
     }
@@ -276,6 +268,14 @@ impl<'d, W: Word> RingBufferedSpiRx<'d, W> {
             }
         }
     }
+
+    /// Return whether the DMA ring buffer contains data, so that a read would not wait.
+    pub fn read_ready(&mut self) -> Result<bool, Error> {
+        let len = self.ring_buf.len().map_err(|e| match e {
+            RingBufferError::Overrun => Error::Overrun,
+        })?;
+        Ok(len > 0)
+    }
 }
 
 impl<W: Word> Drop for RingBufferedSpiRx<'_, W> {
@@ -297,18 +297,7 @@ impl embedded_io_async::Read for RingBufferedSpiRx<'_, u8> {
 
 impl<W: Word> ReadReady for RingBufferedSpiRx<'_, W> {
     fn read_ready(&mut self) -> Result<bool, Self::Error> {
-        let len = self.ring_buf.len().map_err(|e| match e {
-            crate::dma::ringbuffer::Error::Overrun => Error::Overrun,
-            crate::dma::ringbuffer::Error::DmaUnsynced => {
-                error!(
-                    "Ringbuffer error: DmaUNsynced, driver implementation is
-                    probably bugged please open an issue"
-                );
-                // we report this as overrun since its recoverable in the same way
-                Error::Overrun
-            }
-        })?;
-        Ok(len > 0)
+        RingBufferedSpiRx::read_ready(self)
     }
 }
 

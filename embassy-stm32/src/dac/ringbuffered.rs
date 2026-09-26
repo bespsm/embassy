@@ -4,8 +4,8 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::dac::{ChannelEvent, Info, State, Word};
+pub use crate::dma::RingBufferError as Error;
 use crate::dma::WritableRingBuffer;
-use crate::dma::ringbuffer::Error;
 
 /// A DAC channel backed by a DMA ring buffer.
 ///
@@ -96,7 +96,7 @@ impl<'d, W: Word> RingBufferedDacChannel<'d, W> {
 
     /// Stop the DMA transfer, waiting until all buffered samples have been output.
     pub async fn stop(&mut self) {
-        self.ring_buf.stop().await;
+        self.ring_buf.disable_circular_and_wait().await;
     }
 }
 

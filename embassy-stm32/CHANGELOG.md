@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## Unreleased - ReleaseDate
 
+Flash:
+- fix: stm32/flash: preserve F2/F4/F7/H7 PSIZE during programming cleanup so subsequent erases retain x32 parallelism.
+- add: `flash::Config` and `Flash::new_with_config` / `new_blocking_with_config` for optional erase parallelism on STM32F2/F4/F7 and `flash_h7`. Existing constructors keep their defaults; regions preserve the selection.
+
 Align to API guidelines:
 - change: stm32/gpio: rename `get_level()` to `level()` and `get_output_level()` to `output_level()` on `Input`, `Output`, `OutputOpenDrain`, `Flex` and `ExtiInput`. `lpgpio::LpGpio::get_level()` is now `level()`.
 - change: stm32/rng: `Rng` is now `Rng<'d, M: Mode>` with the instance type erased. Added `Rng::new_blocking` and `Rng::new_blocking_with_config`. The async `async_fill_bytes` is now `fill_bytes`; the blocking `fill_bytes`, `next_u32` and `next_u64` are now `blocking_fill_bytes`, `blocking_next_u32` and `blocking_next_u64`.
@@ -15,6 +19,8 @@ Align to API guidelines:
 - change: stm32/usart: `BufferedUart::new` takes the interrupt binding before the buffers.
 - change: stm32/usart: `Uart::split_ref` returns owned `(UartTx<'_, M>, UartRx<'_, M>)` halves instead of `&mut` references.
 - change: stm32/usart: removed the `nb`-based `embedded_hal_02::serial::Read` and `embedded_hal_nb::serial::{Read, Write}` implementations.
+- add: stm32/usart: inherent `read`, `blocking_read`, `fill_buf`, `consume`, `read_ready`, `write`, `flush`, `blocking_write`, `blocking_flush` and `write_ready` methods on `BufferedUart`, `BufferedUartRx` and `BufferedUartTx`.
+- add: stm32/usart: inherent `read_ready` method on `RingBufferedUartRx`.
 - add: stm32: `Config::enable_analog_switch_booster` enables the I/O analog switch voltage booster.
 - change: stm32/adc: the interrupt-driven `irq_read` is now `read`; the DMA method previously named `read` is now `read_sequence`.
 - change: stm32/adc: one `Adc<'d, T, M: Mode>` driver for every chip, with the same API everywhere. Methods and configuration options only exist on chips whose ADC supports them.
@@ -57,6 +63,9 @@ DMA:
 - fix: stm32/dma: compute GPDMA `BR1.BNDT` from the memory-side width regardless of direction, fixing destination overrun on reads with peripheral width > memory width
 - feat: stm32/dma: GPDMA: allow access to construct custom LinkedList chains for scatter/gather DMA
 - feat: stm32/dma: add `TwoDItem`, `TwoDConfig`, and `LinkedListItem` trait; `Table` is now generic over item type
+
+I2S:
+- feat: stm32/i2s: add `I2S::rx_len()` returning the number of samples buffered in the RX DMA ring buffer
 
 I2C:
 - feat: stm32/i2cv2: support zero-length transfers instead of returning `Error::ZeroLengthTransfer`, enabling bus scans via `transaction(addr, &mut [Operation::Write(&[])])`. On the slave side an empty `respond_to_write` accepts zero bytes and an empty `respond_to_read` sends `0xFF` filler, since I2C cannot encode "nothing to send"; both previously left ADDR set, holding SCL low and wedging the bus
